@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f install.sh
+          test -d src
+          test -d packaging
+          test -f README.md
+
+          mkdir -p dist
+
+          # Build a stable-named tarball for "latest/download/netwatch.tar.gz"
+          tar -czf dist/netwatch.tar.gz install.sh README.md packaging src
+
+          # Bootstrap installer must exist in repo at packaging/netwatch-install.sh
+          test -f packaging/netwatch-install.sh
+          cp packaging/netwatch-install.sh dist/netwatch-install.sh
+          chmod +x dist/netwatch-install.sh
+
+          (cd dist && sha256sum netwatch.tar.gz netwatch-install.sh > SHA256SUMS)
+
+          echo "Built artifacts:"
+          ls -lah dist
+
+      - name: Create or update GitHub Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/netwatch.tar.gz
+            dist/netwatch-install.sh
+            dist/SHA256SUMS
+          generate_release_notes: true

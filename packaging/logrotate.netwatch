@@ -1,0 +1,9 @@
+/var/log/netwatch/*.log /var/log/netwatch/*.jsonl /var/log/netwatch/*.csv {
+  daily
+  rotate 14
+  missingok
+  notifempty
+  compress
+  delaycompress
+  copytruncate
+}

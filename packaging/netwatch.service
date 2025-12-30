@@ -1,0 +1,16 @@
+[Unit]
+Description=netwatch – Internet quality evidence collector (24h default)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@@RUNNER@@
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+# Force LF for shell scripts
+*.sh text eol=lf
+
+# YAML & config files
+*.yml text eol=lf
+*.yaml text eol=lf
+*.conf text eol=lf
+
+# Markdown darf LF
+*.md text eol=lf
