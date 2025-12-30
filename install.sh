@@ -93,8 +93,16 @@ install_files() {
   # Prefer rsync, fallback to cp -a
   if have_cmd rsync; then
     rsync -a "${SRC_DIR}/" "${INSTALL_DIR}/"
+    # Install installer itself for uninstall/upgrade
+cp "$(basename "$0")" "${INSTALL_DIR}/install.sh"
+chmod 0755 "${INSTALL_DIR}/install.sh"
+
   else
     cp -a "${SRC_DIR}/." "${INSTALL_DIR}/"
+    # Install installer itself for uninstall/upgrade
+cp "$(basename "$0")" "${INSTALL_DIR}/install.sh"
+chmod 0755 "${INSTALL_DIR}/install.sh"
+
   fi
 
   # Ensure executable scripts
