@@ -9,7 +9,7 @@ CONFIG_FILE="/etc/${APP}/${APP}.conf"
 EXAMPLE_FILE="${BASE_DIR}/config.example.conf"
 
 load_config() {
-  # If config is missing, attempt to create it from example (prevents restart-loop)
+  # Auto-create config from example if missing (prevents restart loops)
   if [[ ! -f "${CONFIG_FILE}" ]]; then
     if [[ -f "${EXAMPLE_FILE}" && -s "${EXAMPLE_FILE}" ]]; then
       mkdir -p "/etc/${APP}"
@@ -23,17 +23,23 @@ load_config() {
   # shellcheck disable=SC1090
   source "${CONFIG_FILE}"
 
-  # Defaults (safe fallback; should normally come from config)
+  # Defaults
   : "${LOG_DIR:=/var/log/${APP}}"
   : "${EXPORT_DIR:=/var/log/${APP}/export}"
 
-  : "${SUMMARY_INTERVAL_SEC:=300}"
+  : "${DURATION_HOURS:=24}"
+  : "${DURATION_SEC:=}"
+
   : "${PING_BURST_INTERVAL_SEC:=20}"
+  : "${SUMMARY_INTERVAL_SEC:=300}"
   : "${MTR_INTERVAL_SEC:=1800}"
   : "${IPERF_UDP_INTERVAL_SEC:=900}"
   : "${SPEEDTEST_INTERVAL_SEC:=3600}"
 
-  # Create directories now (avoid later write failures)
+  : "${PING_BURST_COUNT:=10}"
+  : "${PING_BURST_I:=0.2}"
+
+  # Create dirs early
   mkdirp "${LOG_DIR}"
   mkdirp "${EXPORT_DIR}"
 }
@@ -42,7 +48,6 @@ init_storage() {
   mkdirp "$LOG_DIR"
   mkdirp "$EXPORT_DIR"
 
-  # 5-min CSVs
   if [[ ! -f "${LOG_DIR}/ping_5min.csv" ]]; then
     printf "time_iso,window_s,target,sent,received,loss_pct,rtt_min_ms,rtt_avg_ms,rtt_max_ms,rtt_mdev_ms\n" > "${LOG_DIR}/ping_5min.csv"
   fi
@@ -55,15 +60,26 @@ duration_seconds() {
   if [[ -n "${DURATION_SEC:-}" ]]; then
     echo "$DURATION_SEC"
   else
-    echo $(( (${DURATION_HOURS:-24}) * 3600 ))
+    echo $(( DURATION_HOURS * 3600 ))
   fi
 }
 
-run_component() {
-  local script="$1"
-  shift || true
+# Optional components should not kill the daemon if missing
+run_component_optional() {
+  local script="$1"; shift || true
+  if [[ -x "${BASE_DIR}/components/${script}" ]]; then
+    "${BASE_DIR}/components/${script}" "$@" || true
+  else
+    log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"warn\",\"msg\":\"optional component missing\",\"component\":\"${script}\"}"
+    return 0
+  fi
+}
+
+# Required components must exist, but failures should not kill the daemon loop
+run_component_required() {
+  local script="$1"; shift || true
   [[ -x "${BASE_DIR}/components/${script}" ]] || die "Component fehlt/nicht ausführbar: ${BASE_DIR}/components/${script}"
-  "${BASE_DIR}/components/${script}" "$@"
+  "${BASE_DIR}/components/${script}" "$@" || true
 }
 
 main() {
@@ -92,43 +108,55 @@ main() {
     [[ "${stop_requested}" -eq 1 ]] && break
     [[ "${now}" -ge "${end_ts}" ]] && break
 
-    # Ping burst
+    # --- Ping burst (frequent) ---
     if [[ "${now}" -ge "${next_ping}" ]]; then
-      run_component "ping_quality.sh" "${CONFIG_FILE}" || true
+      for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        # usage: ping_quality.sh burst|summary LOG_DIR TARGET [window_s] [count] [interval]
+        run_component_required "ping_quality.sh" burst "${LOG_DIR}" "${target}" "" "${PING_BURST_COUNT}" "${PING_BURST_I}"
+      done
       next_ping=$(( now + PING_BURST_INTERVAL_SEC ))
     fi
 
-    # DNS quality
-    if [[ "${now}" -ge "${next_ping}" ]]; then
-      : # (kept intentionally - ping and dns can share interval)
-    fi
-    if [[ "${now}" -ge $(( next_ping - PING_BURST_INTERVAL_SEC )) ]]; then
-      run_component "dns_quality.sh" "${CONFIG_FILE}" || true
+    # --- 5-min Summary window ---
+    if [[ "${now}" -ge "${next_summary}" ]]; then
+      # ping summary per target
+      for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        run_component_required "ping_quality.sh" summary "${LOG_DIR}" "${target}" "${SUMMARY_INTERVAL_SEC}"
+      done
+
+      # dns summary-style probes (one shot that writes rows tagged with window_s)
+      local rr="A"
+      for resolver in "${LOCAL_DNS:-192.168.100.4}" "${UPSTREAM_DNS[@]:-1.1.1.1 8.8.8.8}"; do
+        # usage: dns_quality.sh LOG_DIR window_s RESOLVER domain1 domain2 ...
+        run_component_required "dns_quality.sh" "${LOG_DIR}" "${SUMMARY_INTERVAL_SEC}" "${resolver}" "${DNS_TEST_DOMAINS[@]:-google.com cloudflare.com github.com heise.de}"
+      done
+
+      # optional AAAA test pass (if your component supports it via config, it will do it; if not, harmless)
+      next_summary=$(( now + SUMMARY_INTERVAL_SEC ))
     fi
 
-    # MTR snapshot
+    # --- MTR snapshot (less frequent) ---
     if [[ "${now}" -ge "${next_mtr}" ]]; then
-      run_component "mtr_snapshot.sh" "${CONFIG_FILE}" || true
+      for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        # usage: mtr_snapshot.sh LOG_DIR TARGET
+        run_component_required "mtr_snapshot.sh" "${LOG_DIR}" "${target}"
+      done
       next_mtr=$(( now + MTR_INTERVAL_SEC ))
     fi
 
-    # iperf UDP (optional)
+    # --- iperf UDP (optional) ---
     if [[ "${now}" -ge "${next_iperf}" ]]; then
-      run_component "iperf_udp.sh" "${CONFIG_FILE}" || true
+      # If server empty, component will just exit 0 (see iperf_udp.sh below)
+      run_component_optional "iperf_udp.sh" "${LOG_DIR}" "${IPERF3_SERVER:-}" "${IPERF3_PORT:-5201}" "${IPERF3_UDP_BW:-5M}" "${IPERF3_UDP_TIME:-30}"
       next_iperf=$(( now + IPERF_UDP_INTERVAL_SEC ))
     fi
 
-    # Speedtest
+    # --- Speedtest (optional) ---
     if [[ "${now}" -ge "${next_speed}" ]]; then
-      run_component "speedtest.sh" "${CONFIG_FILE}" || true
+      # We don't know your component signature; most versions take LOG_DIR.
+      # If your speedtest.sh expects different args, it should print usage but won't kill daemon due to || true inside wrapper.
+      run_component_optional "speedtest.sh" "${LOG_DIR}" "${SPEEDTEST_TIMEOUT_SEC:-60}"
       next_speed=$(( now + SPEEDTEST_INTERVAL_SEC ))
-    fi
-
-    # Summary/report (5-min)
-    if [[ "${now}" -ge "${next_summary}" ]]; then
-      run_component "summary_5min.sh" "${CONFIG_FILE}" || true
-      run_component "report_5min.sh" "${CONFIG_FILE}" || true
-      next_summary=$(( now + SUMMARY_INTERVAL_SEC ))
     fi
 
     sleep 1
@@ -136,8 +164,8 @@ main() {
 
   log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"stop\",\"run_id\":${run_id},\"end_ts\":${end_ts}}"
 
-  # Final report/export attempt
-  run_component "report_final.sh" "${CONFIG_FILE}" || true
+  # Final report (optional)
+  run_component_optional "report_final.sh" "${LOG_DIR}" "${EXPORT_DIR}"
 }
 
 main "$@"
