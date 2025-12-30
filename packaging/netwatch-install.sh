@@ -4,8 +4,6 @@ set -euo pipefail
 OWNER="IT-Onkel"
 REPO="netwatch"
 
-# Optional: pin a version (tag), e.g.:
-# curl .../netwatch-install.sh | sudo bash -s -- v1.2.3
 PINNED_TAG="${1:-latest}"
 
 need_root() {
@@ -21,8 +19,7 @@ fetch() {
   elif have wget; then
     wget -q "$url" -O "$out"
   else
-    echo "Weder curl noch wget vorhanden. Bitte eins installieren (apt-get install -y curl)."
-    exit 1
+    echo "Weder curl noch wget vorhanden."; exit 1
   fi
 }
 
@@ -43,20 +40,18 @@ main() {
   echo "netwatch bootstrap: fetching ${tar_url}"
   fetch "$tar_url" "${tmp}/${REPO}.tar.gz"
 
-  mkdir -p "${tmp}/${REPO}"
-  tar -xzf "${tmp}/${REPO}.tar.gz" -C "${tmp}/${REPO}"
+  cd "$tmp"
+  tar -xzf "${REPO}.tar.gz"
 
-  local install_path=""
-  if [[ -f "${tmp}/${REPO}/install.sh" ]]; then
-    install_path="${tmp}/${REPO}/install.sh"
-  else
-    install_path="$(find "${tmp}/${REPO}" -maxdepth 2 -type f -name install.sh | head -n 1 || true)"
-  fi
+  # Find project root (contains install.sh + src/)
+  local proj
+  proj="$(find . -maxdepth 2 -type f -name install.sh | head -n 1 | xargs dirname)"
 
-  [[ -n "$install_path" && -f "$install_path" ]] || { echo "install.sh nicht im Release-Tarball gefunden."; exit 1; }
+  [[ -d "${proj}/src" ]] || { echo "src/ not found in release archive"; exit 1; }
 
-  echo "netwatch bootstrap: running ${install_path}"
-  bash "$install_path"
+  echo "netwatch bootstrap: running installer in ${proj}"
+  cd "$proj"
+  bash ./install.sh
 }
 
 main
