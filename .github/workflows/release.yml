@@ -16,7 +16,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-            - name: Prepare artifacts
+      - name: Prepare artifacts
         shell: bash
         run: |
           set -euo pipefail
