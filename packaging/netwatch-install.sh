@@ -28,7 +28,8 @@ main() {
 
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap '[ -n "${tmp:-}" ] && rm -rf "$tmp"' EXIT
+
 
   local tar_url
   if [[ "$PINNED_TAG" == "latest" ]]; then

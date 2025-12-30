@@ -84,10 +84,26 @@ EOF
 
 install_config() {
   mkdir -p "${CONF_DIR}"
-  if [[ ! -f "${CONF_FILE}" ]]; then
-    cp "${INSTALL_DIR}/config.example.conf" "${CONF_FILE}"
+
+  # Quelle der Example-Config: erst aus installierten Files, fallback aus Repo
+  local example_src=""
+  if [[ -f "${INSTALL_DIR}/config.example.conf" ]]; then
+    example_src="${INSTALL_DIR}/config.example.conf"
+  elif [[ -f "${SRC_DIR}/config.example.conf" ]]; then
+    example_src="${SRC_DIR}/config.example.conf"
+  else
+    echo "Fehlt: config.example.conf (weder in ${INSTALL_DIR} noch in ${SRC_DIR})"
+    exit 1
   fi
+
+  if [[ ! -f "${CONF_FILE}" ]]; then
+    cp "$example_src" "${CONF_FILE}"
+  fi
+
+  # Log dirs anlegen (damit Service nicht wegen fehlender Pfade scheitert)
+  mkdir -p /var/log/netwatch /var/log/netwatch/export
 }
+
 
 install_logrotate() {
   install -m 0644 "${PKG_DIR}/logrotate.${APP}" "${LOGROTATE_DST}"
