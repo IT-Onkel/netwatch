@@ -13,100 +13,92 @@ LOGROTATE_DST="/etc/logrotate.d/${APP}"
 CONF_DIR="/etc/${APP}"
 CONF_FILE="${CONF_DIR}/${APP}.conf"
 
-# ----------------------------
-# Helpers
-# ----------------------------
-need_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Bitte sudo nutzen."; exit 1; }
-}
-
+need_root() { [[ "${EUID:-$(id -u)}" -eq 0 ]] || { echo "Bitte sudo nutzen."; exit 1; }; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
-
 die() { echo "❌ $*" >&2; exit 1; }
-
 info() { echo "➡️  $*"; }
 
 require_files() {
   [[ -d "${SRC_DIR}" ]] || die "Fehlt: ${SRC_DIR}/"
   [[ -f "${SRC_DIR}/${APP}d.sh" ]] || die "Fehlt: ${SRC_DIR}/${APP}d.sh"
+  [[ -f "${SRC_DIR}/lib.sh" ]] || die "Fehlt: ${SRC_DIR}/lib.sh"
+  [[ -f "${SRC_DIR}/config.example.conf" ]] || die "Fehlt: ${SRC_DIR}/config.example.conf"
+  [[ -s "${SRC_DIR}/config.example.conf" ]] || die "src/config.example.conf ist leer (0 Byte) – bitte füllen!"
   [[ -f "${PKG_DIR}/${APP}.service" ]] || die "Fehlt: ${PKG_DIR}/${APP}.service"
   [[ -f "${PKG_DIR}/logrotate.${APP}" ]] || die "Fehlt: ${PKG_DIR}/logrotate.${APP}"
-  [[ -f "${SRC_DIR}/config.example.conf" ]] || die "Fehlt: ${SRC_DIR}/config.example.conf"
 }
 
-# ----------------------------
-# Debian deps
-# ----------------------------
 install_deps_debian() {
   export DEBIAN_FRONTEND=noninteractive
-
-  if ! have_cmd apt-get; then
-    die "apt-get nicht gefunden. Dieses install.sh unterstützt aktuell Debian/Ubuntu."
-  fi
+  have_cmd apt-get || die "apt-get nicht gefunden. Dieses install.sh ist für Debian/Ubuntu gedacht."
 
   info "APT update…"
   apt-get update -y
 
-  # Heal a broken dpkg state if previous attempts failed
-  info "DPKG state check/heal…"
+  # Heal broken dpkg state if any
+  info "DPKG heal (falls vorher etwas hängen blieb)…"
   apt-get -y -f install
 
-  # Speedtest handling:
-  # - Prefer Ookla package 'speedtest' (packagecloud) if available
-  # - Avoid installing 'speedtest-cli' because it collides on /usr/bin/speedtest
-  # - If speedtest-cli is installed, remove it (safe) to avoid conflicts.
+  # Speedtest: avoid speedtest-cli collision with Ookla speedtest package
   if dpkg -s speedtest-cli >/dev/null 2>&1; then
-    info "Entferne speedtest-cli (Konflikt mit Ookla speedtest)…"
+    info "Entferne speedtest-cli (kollidiert mit Ookla speedtest /usr/bin/speedtest)…"
     apt-get purge -y speedtest-cli || true
     apt-get -y -f install
   fi
 
   local pkgs=(
-    iputils-ping
-    dnsutils
-    mtr-tiny
-    jq
-    gawk
     coreutils
+    gawk
+    iputils-ping
+    mtr-tiny
+    dnsutils
     iperf3
+    jq
   )
 
-  # Install Ookla speedtest if not already present
+  # Prefer Ookla speedtest if not present
   if ! dpkg -s speedtest >/dev/null 2>&1; then
     pkgs+=(speedtest)
   fi
 
-  info "Installiere Abhängigkeiten: ${pkgs[*]}"
+  info "Installiere Pakete: ${pkgs[*]}"
   apt-get install -y "${pkgs[@]}"
 
-  # Final heal just in case
+  # Final heal
   apt-get -y -f install
 }
 
-# ----------------------------
-# Files
-# ----------------------------
 install_files() {
   info "Installiere Dateien nach ${INSTALL_DIR}"
   mkdir -p "${INSTALL_DIR}"
 
-  # Prefer rsync, fallback to cp -a
   if have_cmd rsync; then
     rsync -a "${SRC_DIR}/" "${INSTALL_DIR}/"
-    # Install installer itself for uninstall/upgrade
-cp "$(basename "$0")" "${INSTALL_DIR}/install.sh"
-chmod 0755 "${INSTALL_DIR}/install.sh"
-
   else
     cp -a "${SRC_DIR}/." "${INSTALL_DIR}/"
-    # Install installer itself for uninstall/upgrade
-cp "$(basename "$0")" "${INSTALL_DIR}/install.sh"
-chmod 0755 "${INSTALL_DIR}/install.sh"
-
   fi
 
-  # Ensure executable scripts
+  # Ensure scripts executable
   find "${INSTALL_DIR}" -type f -name "*.sh" -exec chmod 0755 {} \;
+
+  # Ensure example config exists and is NOT empty
+  [[ -f "${INSTALL_DIR}/config.example.conf" ]] || die "Fehlt nach Copy: ${INSTALL_DIR}/config.example.conf"
+  [[ -s "${INSTALL_DIR}/config.example.conf" ]] || die "Installierte Example-Config ist leer: ${INSTALL_DIR}/config.example.conf"
+
+  # Install install.sh itself for uninstall/upgrades
+  # Works even when executed from /tmp (bootstrap)
+  info "Installiere Installer für Uninstall/Upgrade: ${INSTALL_DIR}/install.sh"
+  if [[ -f "./install.sh" ]]; then
+    cp "./install.sh" "${INSTALL_DIR}/install.sh"
+  else
+    # fallback: if script not called from repo root (rare)
+    cp "$0" "${INSTALL_DIR}/install.sh" || true
+  fi
+  chmod 0755 "${INSTALL_DIR}/install.sh"
+
+  # Ownership hardening
+  chown -R root:root "${INSTALL_DIR}" || true
+  chmod 0644 "${INSTALL_DIR}/config.example.conf" || true
 
   info "Installiere Runner: ${RUNNER}"
   cat > "${RUNNER}" <<EOF
@@ -127,10 +119,9 @@ usage() {
 Usage:
   netwatch start|stop|restart|status
   netwatch enable|disable
-  netwatch logs          (journalctl -u netwatch -f)
-  netwatch logs-tail N   (journalctl -u netwatch -n N)
-  netwatch export        (list evidence bundles)
-  netwatch report        (show latest human report if present)
+  netwatch logs            (journalctl -u netwatch -f)
+  netwatch logs-tail [N]   (journalctl -u netwatch -n N)
+  netwatch export          (list evidence bundles)
 USAGE
 }
 
@@ -149,15 +140,6 @@ case "$cmd" in
   export)
     ls -lah /var/log/netwatch/export 2>/dev/null || true
     ;;
-  report)
-    latest="$(ls -1t /var/log/netwatch/export/*/REPORT.md 2>/dev/null | head -n 1 || true)"
-    if [[ -n "${latest}" ]]; then
-      echo "==> ${latest}"
-      sed -n '1,200p' "${latest}"
-    else
-      echo "Kein REPORT.md gefunden (noch keine Export-Läufe?)"
-    fi
-    ;;
   ""|-h|--help|help)
     usage
     ;;
@@ -171,27 +153,20 @@ EOF
   chmod 0755 "${CTL}"
 }
 
-# ----------------------------
-# Config & dirs
-# ----------------------------
 install_config() {
   info "Konfiguration…"
   mkdir -p "${CONF_DIR}"
 
-  # Always ensure example config is available in INSTALL_DIR
-  if [[ ! -f "${INSTALL_DIR}/config.example.conf" ]]; then
-    # Should have been copied by install_files, but be safe
-    cp "${SRC_DIR}/config.example.conf" "${INSTALL_DIR}/config.example.conf"
-  fi
-
   if [[ ! -f "${CONF_FILE}" ]]; then
     info "Erzeuge Default-Config: ${CONF_FILE}"
     cp "${INSTALL_DIR}/config.example.conf" "${CONF_FILE}"
+    chmod 0644 "${CONF_FILE}" || true
+    chown root:root "${CONF_FILE}" || true
   else
     info "Config existiert bereits, lasse unverändert: ${CONF_FILE}"
   fi
 
-  # Create log dirs so service cannot fail on missing paths
+  # Ensure log dirs exist
   mkdir -p /var/log/netwatch /var/log/netwatch/export
   chmod 0755 /var/log/netwatch /var/log/netwatch/export || true
 }
@@ -208,27 +183,22 @@ install_systemd() {
   sed "s|@@RUNNER@@|${RUNNER}|g" "${PKG_DIR}/${APP}.service" > "${SYSTEMD_UNIT}"
 
   systemctl daemon-reload
-
-  # Enable + start (or restart if already active)
   systemctl enable "${APP}.service"
   systemctl restart "${APP}.service" || systemctl start "${APP}.service"
 }
 
-# ----------------------------
-# Uninstall
-# ----------------------------
 uninstall_all() {
   local purge="${1:-false}"
 
-  have_cmd systemctl && systemctl disable --now "${APP}.service" 2>/dev/null || true
+  systemctl disable --now "${APP}.service" 2>/dev/null || true
   rm -f "${SYSTEMD_UNIT}"
-  have_cmd systemctl && systemctl daemon-reload 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
 
   rm -f "${CTL}" "${RUNNER}" "${LOGROTATE_DST}"
   rm -rf "${INSTALL_DIR}"
 
   if [[ "${purge}" == "true" ]]; then
-    info "Purge: entferne Config + Logs"
+    echo "🧹 Purge: entferne Config + Logs"
     rm -rf "${CONF_DIR}"
     rm -rf /var/log/netwatch
   else
@@ -251,20 +221,10 @@ main() {
   need_root
 
   case "${1:-}" in
-    --uninstall)
-      uninstall_all false
-      exit 0
-      ;;
-    --purge)
-      uninstall_all true
-      exit 0
-      ;;
-    "" )
-      ;;
-    * )
-      usage
-      exit 2
-      ;;
+    --uninstall) uninstall_all false; exit 0 ;;
+    --purge)     uninstall_all true; exit 0 ;;
+    "" ) ;;
+    * ) usage; exit 2 ;;
   esac
 
   require_files
@@ -274,11 +234,12 @@ main() {
   install_logrotate
   install_systemd
 
-  echo "✅ ${APP} installiert."
+  echo "✅ netwatch installiert."
   echo "Config: ${CONF_FILE}"
-  echo "Status: ${APP} status"
-  echo "Logs: ${APP} logs"
-  echo "Evidence: ${APP} export"
+  echo "Status: netwatch status"
+  echo "Logs: netwatch logs"
+  echo "Evidence: netwatch export"
+  echo "Uninstall: sudo bash ${INSTALL_DIR}/install.sh --uninstall"
 }
 
 main "$@"

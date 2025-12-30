@@ -1,26 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
 . "${BASE_DIR}/lib.sh"
 
-CONFIG_FILE="/etc/netwatch/netwatch.conf"
+APP="netwatch"
+CONFIG_FILE="/etc/${APP}/${APP}.conf"
+EXAMPLE_FILE="${BASE_DIR}/config.example.conf"
 
 load_config() {
-  [[ -f "$CONFIG_FILE" ]] || die "Config fehlt: ${CONFIG_FILE} (install.sh legt ein Beispiel an)"
+  # If config is missing, attempt to create it from example (prevents restart-loop)
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    if [[ -f "${EXAMPLE_FILE}" && -s "${EXAMPLE_FILE}" ]]; then
+      mkdir -p "/etc/${APP}"
+      cp "${EXAMPLE_FILE}" "${CONFIG_FILE}"
+      chmod 0644 "${CONFIG_FILE}" || true
+    else
+      die "Config fehlt: ${CONFIG_FILE} (und Example fehlt/leer: ${EXAMPLE_FILE})"
+    fi
+  fi
+
   # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-  : "${LOG_DIR:?}"
-  : "${EXPORT_DIR:?}"
-  : "${SUMMARY_INTERVAL_SEC:?}"
-  : "${PING_BURST_INTERVAL_SEC:?}"
-  : "${MTR_INTERVAL_SEC:?}"
-  : "${IPERF_UDP_INTERVAL_SEC:?}"
-  : "${SPEEDTEST_INTERVAL_SEC:?}"
+  source "${CONFIG_FILE}"
+
+  # Defaults (safe fallback; should normally come from config)
+  : "${LOG_DIR:=/var/log/${APP}}"
+  : "${EXPORT_DIR:=/var/log/${APP}/export}"
+
+  : "${SUMMARY_INTERVAL_SEC:=300}"
+  : "${PING_BURST_INTERVAL_SEC:=20}"
+  : "${MTR_INTERVAL_SEC:=1800}"
+  : "${IPERF_UDP_INTERVAL_SEC:=900}"
+  : "${SPEEDTEST_INTERVAL_SEC:=3600}"
+
+  # Create directories now (avoid later write failures)
+  mkdirp "${LOG_DIR}"
+  mkdirp "${EXPORT_DIR}"
 }
 
 init_storage() {
   mkdirp "$LOG_DIR"
   mkdirp "$EXPORT_DIR"
+
+  # 5-min CSVs
   if [[ ! -f "${LOG_DIR}/ping_5min.csv" ]]; then
     printf "time_iso,window_s,target,sent,received,loss_pct,rtt_min_ms,rtt_avg_ms,rtt_max_ms,rtt_mdev_ms\n" > "${LOG_DIR}/ping_5min.csv"
   fi
@@ -37,6 +59,13 @@ duration_seconds() {
   fi
 }
 
+run_component() {
+  local script="$1"
+  shift || true
+  [[ -x "${BASE_DIR}/components/${script}" ]] || die "Component fehlt/nicht ausführbar: ${BASE_DIR}/components/${script}"
+  "${BASE_DIR}/components/${script}" "$@"
+}
+
 main() {
   load_config
   init_storage
@@ -50,8 +79,7 @@ main() {
 
   log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"start\",\"run_id\":${run_id},\"end_ts\":${end_ts}}"
 
-  local next_ping next_summary next_mtr next_iperf next_speed
-  local now
+  local now next_ping next_summary next_mtr next_iperf next_speed
   now="$(ts_epoch)"
   next_ping="$now"
   next_summary="$now"
@@ -59,65 +87,57 @@ main() {
   next_iperf="$now"
   next_speed="$now"
 
-  while [[ "$stop_requested" -eq 0 ]]; do
+  while true; do
     now="$(ts_epoch)"
-    if (( now >= end_ts )); then
-      break
-    fi
+    [[ "${stop_requested}" -eq 1 ]] && break
+    [[ "${now}" -ge "${end_ts}" ]] && break
 
-    if (( now >= next_ping )); then
-      for t in "${PING_TARGETS[@]}"; do
-        "${BASE_DIR}/components/ping_quality.sh" burst "$LOG_DIR" "$t" "${PING_BURST_COUNT}" "${PING_BURST_I}"
-      done
+    # Ping burst
+    if [[ "${now}" -ge "${next_ping}" ]]; then
+      run_component "ping_quality.sh" "${CONFIG_FILE}" || true
       next_ping=$(( now + PING_BURST_INTERVAL_SEC ))
     fi
 
-    if (( now >= next_summary )); then
-      for t in "${PING_TARGETS[@]}"; do
-        "${BASE_DIR}/components/ping_quality.sh" summary "$LOG_DIR" "$t" "$SUMMARY_INTERVAL_SEC"
-      done
-
-      # DNS local + upstream
-      "${BASE_DIR}/components/dns_quality.sh" "$LOG_DIR" "$SUMMARY_INTERVAL_SEC" "$LOCAL_DNS" "${DNS_TEST_DOMAINS[@]}"
-      for r in "${UPSTREAM_DNS[@]}"; do
-        "${BASE_DIR}/components/dns_quality.sh" "$LOG_DIR" "$SUMMARY_INTERVAL_SEC" "$r" "${DNS_TEST_DOMAINS[@]}"
-      done
-
-      next_summary=$(( now + SUMMARY_INTERVAL_SEC ))
+    # DNS quality
+    if [[ "${now}" -ge "${next_ping}" ]]; then
+      : # (kept intentionally - ping and dns can share interval)
+    fi
+    if [[ "${now}" -ge $(( next_ping - PING_BURST_INTERVAL_SEC )) ]]; then
+      run_component "dns_quality.sh" "${CONFIG_FILE}" || true
     fi
 
-    if (( now >= next_mtr )); then
-      for t in "${PING_TARGETS[@]}"; do
-        "${BASE_DIR}/components/mtr_snapshot.sh" "$LOG_DIR" "$t"
-      done
+    # MTR snapshot
+    if [[ "${now}" -ge "${next_mtr}" ]]; then
+      run_component "mtr_snapshot.sh" "${CONFIG_FILE}" || true
       next_mtr=$(( now + MTR_INTERVAL_SEC ))
     fi
 
-    if (( now >= next_iperf )); then
-      "${BASE_DIR}/components/iperf_udp.sh" "$LOG_DIR" "${IPERF3_SERVER}" "${IPERF3_PORT}" "${IPERF3_UDP_BW}" "${IPERF3_UDP_TIME}" || true
+    # iperf UDP (optional)
+    if [[ "${now}" -ge "${next_iperf}" ]]; then
+      run_component "iperf_udp.sh" "${CONFIG_FILE}" || true
       next_iperf=$(( now + IPERF_UDP_INTERVAL_SEC ))
     fi
 
-    if (( now >= next_speed )); then
-      "${BASE_DIR}/components/speedtest.sh" "$LOG_DIR" "${SPEEDTEST_TIMEOUT_SEC}"
+    # Speedtest
+    if [[ "${now}" -ge "${next_speed}" ]]; then
+      run_component "speedtest.sh" "${CONFIG_FILE}" || true
       next_speed=$(( now + SPEEDTEST_INTERVAL_SEC ))
+    fi
+
+    # Summary/report (5-min)
+    if [[ "${now}" -ge "${next_summary}" ]]; then
+      run_component "summary_5min.sh" "${CONFIG_FILE}" || true
+      run_component "report_5min.sh" "${CONFIG_FILE}" || true
+      next_summary=$(( now + SUMMARY_INTERVAL_SEC ))
     fi
 
     sleep 1
   done
 
-  # Generate report + evidence bundle
-  local out_dir bundle
-  out_dir="${EXPORT_DIR}/run_${run_id}"
-  mkdirp "$out_dir"
-  "${BASE_DIR}/report/report.sh" "$LOG_DIR" "$out_dir"
+  log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"stop\",\"run_id\":${run_id},\"end_ts\":${end_ts}}"
 
-  bundle="${EXPORT_DIR}/netwatch_evidence_${run_id}.tar.gz"
-  tar -czf "$bundle" -C "$out_dir" . >/dev/null 2>&1 || true
-
-  log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"stop\",\"run_id\":${run_id},\"bundle\":\"${bundle}\"}"
-
-  exit 0
+  # Final report/export attempt
+  run_component "report_final.sh" "${CONFIG_FILE}" || true
 }
 
 main "$@"
