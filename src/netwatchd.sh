@@ -64,20 +64,40 @@ duration_seconds() {
   fi
 }
 
+# Optional components should not kill the daemon if missing
+# Supports:
+#  - "foo.sh" -> BASE_DIR/components/foo.sh
+#  - "report/make_reports.sh" -> BASE_DIR/report/make_reports.sh
 run_component_optional() {
   local script="$1"; shift || true
-  if [[ -x "${BASE_DIR}/components/${script}" ]]; then
-    "${BASE_DIR}/components/${script}" "$@" || true
+  local path=""
+  if [[ "$script" == */* ]]; then
+    path="${BASE_DIR}/${script}"
   else
-    log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"warn\",\"msg\":\"optional component missing\",\"component\":\"${script}\"}"
+    path="${BASE_DIR}/components/${script}"
+  fi
+
+  if [[ -x "$path" ]]; then
+    "$path" "$@" || true
+  else
+    log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"warn\",\"msg\":\"optional component missing\",\"component\":\"${script}\",\"path\":\"${path}\"}"
     return 0
   fi
 }
 
+# Required components must exist, but failures should not kill the daemon loop
+# Supports script path formats same as optional.
 run_component_required() {
   local script="$1"; shift || true
-  [[ -x "${BASE_DIR}/components/${script}" ]] || die "Component fehlt/nicht ausführbar: ${BASE_DIR}/components/${script}"
-  "${BASE_DIR}/components/${script}" "$@" || true
+  local path=""
+  if [[ "$script" == */* ]]; then
+    path="${BASE_DIR}/${script}"
+  else
+    path="${BASE_DIR}/components/${script}"
+  fi
+
+  [[ -x "$path" ]] || die "Component fehlt/nicht ausführbar: ${path}"
+  "$path" "$@" || true
 }
 
 main() {
@@ -106,48 +126,58 @@ main() {
     [[ "${stop_requested}" -eq 1 ]] && break
     [[ "${now}" -ge "${end_ts}" ]] && break
 
-    # Ping burst
+    # --- Ping burst (frequent) ---
     if [[ "${now}" -ge "${next_ping}" ]]; then
       for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        # Expected usage (newer components): ping_quality.sh burst LOG_DIR TARGET COUNT INTERVAL
+        # If your ping component expects another signature, it should not crash the daemon due to || true in wrapper.
         run_component_required "ping_quality.sh" burst "${LOG_DIR}" "${target}" "${PING_BURST_COUNT}" "${PING_BURST_I}"
       done
       next_ping=$(( now + PING_BURST_INTERVAL_SEC ))
     fi
 
-    # Window summary
+    # --- Summary window (5 min default) ---
     if [[ "${now}" -ge "${next_summary}" ]]; then
+      # ping window summary per target
       for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        # Expected usage: ping_quality.sh window LOG_DIR WINDOW_S TARGET
         run_component_required "ping_quality.sh" window "${LOG_DIR}" "${SUMMARY_INTERVAL_SEC}" "${target}"
       done
 
+      # dns window probes (writes rows tagged with window_s)
       for resolver in "${LOCAL_DNS:-192.168.100.4}" "${UPSTREAM_DNS[@]:-1.1.1.1 8.8.8.8}"; do
+        # Expected usage: dns_quality.sh window LOG_DIR WINDOW_S RESOLVER domain1 domain2 ...
         run_component_required "dns_quality.sh" window "${LOG_DIR}" "${SUMMARY_INTERVAL_SEC}" "${resolver}" "${DNS_TEST_DOMAINS[@]:-google.com cloudflare.com github.com heise.de}"
+
+        # AAAA optional pass if enabled
         if [[ "${DO_AAAA_TESTS:-false}" == "true" ]]; then
+          # Expected: dns_quality.sh window LOG_DIR WINDOW_S RESOLVER domains... AAAA
           run_component_required "dns_quality.sh" window "${LOG_DIR}" "${SUMMARY_INTERVAL_SEC}" "${resolver}" "${DNS_TEST_DOMAINS[@]:-google.com cloudflare.com github.com heise.de}" "AAAA"
         fi
       done
 
-      # Build rolling reports every summary window (keeps "dauerhaft verfügbar")
-      run_component_optional "../report/make_reports.sh" "${LOG_DIR}" "${EXPORT_DIR}"
+      # Rolling reports every summary window (keeps "dauerhaft verfügbar")
+      run_component_optional "report/make_reports.sh" "${LOG_DIR}" "${EXPORT_DIR}"
 
       next_summary=$(( now + SUMMARY_INTERVAL_SEC ))
     fi
 
-    # MTR snapshot
+    # --- MTR snapshot (less frequent) ---
     if [[ "${now}" -ge "${next_mtr}" ]]; then
       for target in "${PING_TARGETS[@]:-1.1.1.1 8.8.8.8}"; do
+        # Expected usage: mtr_snapshot.sh run LOG_DIR TARGET
         run_component_required "mtr_snapshot.sh" run "${LOG_DIR}" "${target}"
       done
       next_mtr=$(( now + MTR_INTERVAL_SEC ))
     fi
 
-    # iperf UDP (optional)
+    # --- iperf UDP (optional) ---
     if [[ "${now}" -ge "${next_iperf}" ]]; then
       run_component_optional "iperf_udp.sh" run "${LOG_DIR}" "${IPERF3_SERVER:-}" "${IPERF3_PORT:-5201}" "${IPERF3_UDP_BW:-5M}" "${IPERF3_UDP_TIME:-20}"
       next_iperf=$(( now + IPERF_UDP_INTERVAL_SEC ))
     fi
 
-    # Speedtest (optional)
+    # --- Speedtest (optional) ---
     if [[ "${now}" -ge "${next_speed}" ]]; then
       run_component_optional "speedtest.sh" run "${LOG_DIR}" "${SPEEDTEST_TIMEOUT_SEC:-60}"
       next_speed=$(( now + SPEEDTEST_INTERVAL_SEC ))
@@ -159,8 +189,8 @@ main() {
   log_jsonl "${LOG_DIR}/events.jsonl" "{\"type\":\"stop\",\"run_id\":${run_id},\"end_ts\":${end_ts}}"
 
   # Final report + export bundle at end
-  run_component_optional "../report/make_reports.sh" "${LOG_DIR}" "${EXPORT_DIR}"
-  run_component_optional "../report/export_bundle.sh" "${LOG_DIR}" "${EXPORT_DIR}"
+  run_component_optional "report/make_reports.sh" "${LOG_DIR}" "${EXPORT_DIR}"
+  run_component_optional "report/export_bundle.sh" "${LOG_DIR}" "${EXPORT_DIR}"
 }
 
 main "$@"
