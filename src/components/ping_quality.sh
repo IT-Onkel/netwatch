@@ -1,60 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Produces: ping_bursts.log (raw) and ping_5min.csv (summary)
-. "$(dirname "$0")/../lib.sh"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")" && pwd)/../lib.sh"
 
-ping_burst() {
-  local log_dir="$1" target="$2" count="$3" interval="$4"
-  {
-    echo "=== PING_BURST start=$(ts_iso) target=${target} ==="
-    ping -n -i "$interval" -c "$count" -w 5 "$target" || true
-    echo "=== PING_BURST end=$(ts_iso) target=${target} ==="
-  } >> "${log_dir}/ping_bursts.log" 2>&1
+usage() {
+  die "usage: ping_quality.sh burst LOG_DIR TARGET COUNT INTERVAL  |  ping_quality.sh window LOG_DIR WINDOW_S TARGET"
 }
 
-ping_summary_row() {
-  local log_dir="$1" target="$2" window_s="$3"
-  local now_iso out sent recv loss rmin ravg rmax rmdev
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  burst)
+    LOG_DIR="${1:-}"; TARGET="${2:-}"; COUNT="${3:-}"; INTERVAL="${4:-}"
+    [[ -n "${LOG_DIR}" && -n "${TARGET}" && -n "${COUNT}" && -n "${INTERVAL}" ]] || usage
+    mkdirp "$LOG_DIR"
+    out="${LOG_DIR}/ping_bursts.log"
+    ts="$(ts_iso)"
+    # -q is too quiet; keep parseable output line
+    # We capture summary via "ping -c"
+    ping -n -i "$INTERVAL" -c "$COUNT" -W 1 "$TARGET" 2>&1 | awk -v ts="$ts" -v tgt="$TARGET" '
+      BEGIN{print ts " target="tgt " BEGIN"}
+      {print ts " target="tgt " " $0}
+      END{print ts " target="tgt " END"}
+    ' >> "$out" || true
+    ;;
+  window)
+    LOG_DIR="${1:-}"; WINDOW_S="${2:-}"; TARGET="${3:-}"
+    [[ -n "${LOG_DIR}" && -n "${WINDOW_S}" && -n "${TARGET}" ]] || usage
+    mkdirp "$LOG_DIR"
 
-  now_iso="$(ts_iso)"
-  out="$(ping -n -i 0.2 -c 50 -w 15 "${target}" 2>&1 || true)"
+    # run a burst sized to window? keep small + representative: 10 pings @0.2s
+    local_count=10
+    local_i=0.2
+    ts="$(ts_iso)"
+    tmp="$(mktemp)"
+    ping -n -i "$local_i" -c "$local_count" -W 1 "$TARGET" >"$tmp" 2>/dev/null || true
 
-  sent="$(awk '/packets transmitted/ {print $1; exit}' <<<"$out" 2>/dev/null || echo 0)"
-  recv="$(awk '/packets transmitted/ {print $4; exit}' <<<"$out" 2>/dev/null || echo 0)"
-  loss="$(awk -F'[, ]+' '/packets transmitted/ {for(i=1;i<=NF;i++) if($i ~ /%/) {gsub("%","",$i); print $i; exit}}' <<<"$out" 2>/dev/null || echo "100")"
+    # parse: transmitted, received, loss, rtt min/avg/max/mdev
+    # default unknowns to empty
+    sent="$(awk '/packets transmitted/{print $1}' "$tmp" | tail -n1)"
+    recv="$(awk '/packets transmitted/{print $4}' "$tmp" | tail -n1)"
+    loss="$(awk -F',' '/packets transmitted/{gsub(/%/,"",$3); gsub(/ /,"",$3); print $3}' "$tmp" | tail -n1)"
+    rtt="$(awk -F'=' '/rtt min\/avg\/max\/mdev/{print $2}' "$tmp" | tail -n1 | tr -d ' ')"
+    rtt_min=""; rtt_avg=""; rtt_max=""; rtt_mdev=""
+    if [[ -n "$rtt" ]]; then
+      rtt_min="$(echo "$rtt" | awk -F'/' '{print $1}')"
+      rtt_avg="$(echo "$rtt" | awk -F'/' '{print $2}')"
+      rtt_max="$(echo "$rtt" | awk -F'/' '{print $3}')"
+      rtt_mdev="$(echo "$rtt" | awk -F'/' '{print $4}')"
+    fi
+    rm -f "$tmp"
 
-  rmin=""; ravg=""; rmax=""; rmdev=""
-  if grep -qE '^rtt ' <<<"$out"; then
-    local rtt
-    rtt="$(awk -F'[ =/]+' '/^rtt / {print $5","$6","$7","$8; exit}' <<<"$out" 2>/dev/null || true)"
-    rmin="${rtt%%,*}"
-    ravg="$(cut -d, -f2 <<<"$rtt" 2>/dev/null || true)"
-    rmax="$(cut -d, -f3 <<<"$rtt" 2>/dev/null || true)"
-    rmdev="$(cut -d, -f4 <<<"$rtt" 2>/dev/null || true)"
-  fi
-
-  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
-    "${now_iso}" "${window_s}" "${target}" "${sent}" "${recv}" "${loss}" \
-    "${rmin}" "${ravg}" "${rmax}" "${rmdev}" >> "${log_dir}/ping_5min.csv"
-}
-
-main() {
-  local mode="${1:-}"
-  local log_dir="${2:-}"
-  local target="${3:-}"
-  local window_s="${4:-300}"
-  local count="${5:-10}"
-  local interval="${6:-0.2}"
-
-  [[ -n "$mode" && -n "$log_dir" ]] || die "usage: ping_quality.sh burst|summary LOG_DIR TARGET [window_s] [count] [interval]"
-
-  if [[ "$mode" == "burst" ]]; then
-    ping_burst "$log_dir" "$target" "$count" "$interval"
-  elif [[ "$mode" == "summary" ]]; then
-    ping_summary_row "$log_dir" "$target" "$window_s"
-  else
-    die "unknown mode: $mode"
-  fi
-}
-
-main "$@"
+    csv_append "${LOG_DIR}/ping_5min.csv" "${ts},${WINDOW_S},${TARGET},${sent:-},${recv:-},${loss:-},${rtt_min:-},${rtt_avg:-},${rtt_max:-},${rtt_mdev:-}"
+    ;;
+  *)
+    usage
+    ;;
+esac

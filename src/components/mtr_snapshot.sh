@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Produces: mtr snapshots in LOG_DIR/mtr/
-. "$(dirname "$0")/../lib.sh"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")" && pwd)/../lib.sh"
 
-main() {
-  local log_dir="${1:-}"
-  local target="${2:-}"
-  [[ -n "$log_dir" && -n "$target" ]] || die "usage: mtr_snapshot.sh LOG_DIR TARGET"
+usage() { die "usage: mtr_snapshot.sh run LOG_DIR TARGET"; }
 
-  mkdirp "${log_dir}/mtr"
-  local ts out
-  ts="$(date +%Y%m%d-%H%M%S)"
-  out="${log_dir}/mtr/${ts}_${target}.txt"
+cmd="${1:-}"; shift || true
+[[ "$cmd" == "run" ]] || usage
 
-  ( mtr -ezbw -c 200 "$target" || true ) > "$out" 2>&1
-}
+LOG_DIR="${1:-}"; TARGET="${2:-}"
+[[ -n "$LOG_DIR" && -n "$TARGET" ]] || usage
 
-main "$@"
+mkdirp "${LOG_DIR}/mtr"
+ts="$(date +%Y%m%dT%H%M%S)"
+out="${LOG_DIR}/mtr/mtr_${TARGET//[:\/]/_}_${ts}.txt"
+
+if have_cmd mtr; then
+  mtr -n -r -c 10 "$TARGET" >"$out" 2>&1 || true
+else
+  echo "mtr not found" >"$out"
+fi

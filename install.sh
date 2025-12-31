@@ -20,23 +20,12 @@ info() { echo "➡️  $*"; }
 
 require_files() {
   [[ -d "${SRC_DIR}" ]] || die "Fehlt: ${SRC_DIR}/"
-  [[ -d "${PKG_DIR}" ]] || die "Fehlt: ${PKG_DIR}/"
-
   [[ -f "${SRC_DIR}/${APP}d.sh" ]] || die "Fehlt: ${SRC_DIR}/${APP}d.sh"
   [[ -f "${SRC_DIR}/lib.sh" ]] || die "Fehlt: ${SRC_DIR}/lib.sh"
   [[ -f "${SRC_DIR}/config.example.conf" ]] || die "Fehlt: ${SRC_DIR}/config.example.conf"
   [[ -s "${SRC_DIR}/config.example.conf" ]] || die "src/config.example.conf ist leer (0 Byte) – bitte füllen!"
 
   [[ -d "${SRC_DIR}/components" ]] || die "Fehlt: ${SRC_DIR}/components/"
-  [[ -f "${SRC_DIR}/components/ping_quality.sh" ]] || die "Fehlt: ${SRC_DIR}/components/ping_quality.sh"
-  [[ -f "${SRC_DIR}/components/dns_quality.sh" ]] || die "Fehlt: ${SRC_DIR}/components/dns_quality.sh"
-  [[ -f "${SRC_DIR}/components/mtr_snapshot.sh" ]] || die "Fehlt: ${SRC_DIR}/components/mtr_snapshot.sh"
-  [[ -f "${SRC_DIR}/components/speedtest.sh" ]] || die "Fehlt: ${SRC_DIR}/components/speedtest.sh"
-  # iperf_udp.sh is optional but recommended
-  if [[ ! -f "${SRC_DIR}/components/iperf_udp.sh" ]]; then
-    info "Hinweis: ${SRC_DIR}/components/iperf_udp.sh fehlt (optional)."
-  fi
-
   [[ -d "${SRC_DIR}/report" ]] || die "Fehlt: ${SRC_DIR}/report/"
   [[ -f "${SRC_DIR}/report/make_reports.sh" ]] || die "Fehlt: ${SRC_DIR}/report/make_reports.sh"
   [[ -f "${SRC_DIR}/report/export_bundle.sh" ]] || die "Fehlt: ${SRC_DIR}/report/export_bundle.sh"
@@ -50,17 +39,18 @@ install_deps_debian() {
   have_cmd apt-get || die "apt-get nicht gefunden. Dieses install.sh ist für Debian/Ubuntu gedacht."
 
   info "APT update…"
-  apt-get update -y
+  apt-get update -y || true
 
-  # Heal broken dpkg state if any
   info "DPKG heal (falls vorher etwas hängen blieb)…"
   apt-get -y -f install || true
 
-  # Speedtest: avoid speedtest-cli collision with Ookla speedtest package
-  if dpkg -s speedtest-cli >/dev/null 2>&1; then
-    info "Entferne speedtest-cli (kollidiert mit Ookla speedtest /usr/bin/speedtest)…"
-    apt-get purge -y speedtest-cli || true
-    apt-get -y -f install || true
+  # Speedtest: avoid collision: speedtest-cli provides /usr/bin/speedtest too (often)
+  if dpkg -s speedtest >/dev/null 2>&1; then
+    if dpkg -s speedtest-cli >/dev/null 2>&1; then
+      info "Entferne speedtest-cli (kollidiert mit Ookla speedtest /usr/bin/speedtest)…"
+      apt-get purge -y speedtest-cli || true
+      apt-get -y -f install || true
+    fi
   fi
 
   local pkgs=(
@@ -73,17 +63,18 @@ install_deps_debian() {
     jq
     ca-certificates
     curl
+    tar
   )
 
-  # Prefer Ookla speedtest if not present; do NOT install speedtest-cli.
+  # Prefer Ookla speedtest if available; otherwise speedtest-cli is ok
   if ! dpkg -s speedtest >/dev/null 2>&1; then
-    pkgs+=(speedtest)
+    pkgs+=(speedtest-cli)
   fi
 
   info "Installiere Pakete: ${pkgs[*]}"
   apt-get install -y "${pkgs[@]}" || true
 
-  # Final heal
+  info "Final dpkg heal…"
   apt-get -y -f install || true
 }
 
@@ -113,7 +104,6 @@ install_files() {
   fi
   chmod 0755 "${INSTALL_DIR}/install.sh"
 
-  # Ownership hardening
   chown -R root:root "${INSTALL_DIR}" || true
   chmod 0644 "${INSTALL_DIR}/config.example.conf" || true
 
@@ -129,19 +119,19 @@ EOF
   cat > "${CTL}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-
 svc="netwatch.service"
-BASE="/usr/local/lib/netwatch"
+base="/usr/local/lib/netwatch"
 
 usage() {
   cat <<USAGE
 Usage:
   netwatch start|stop|restart|status
   netwatch enable|disable
-  netwatch logs                 (journalctl -u netwatch -f)
-  netwatch logs-tail [N]        (journalctl -u netwatch -n N)
-  netwatch report               (create TXT/CSV/HTML report bundle folder)
-  netwatch export               (report + tar.gz + sha256)
+  netwatch logs               (journalctl -u netwatch -f)
+  netwatch logs-tail [N]      (journalctl -u netwatch -n N)
+  netwatch report             (build reports into /var/log/netwatch/export)
+  netwatch export             (create evidence bundle .tar.gz)
+  netwatch where              (show paths)
 USAGE
 }
 
@@ -158,10 +148,17 @@ case "$cmd" in
     exec journalctl -u "$svc" -n "$n" --no-pager
     ;;
   report)
-    exec "${BASE}/report/make_reports.sh"
+    exec sudo -n bash "${base}/report/make_reports.sh" "/var/log/netwatch" "/var/log/netwatch/export"
     ;;
   export)
-    exec "${BASE}/report/export_bundle.sh"
+    exec sudo -n bash "${base}/report/export_bundle.sh" "/var/log/netwatch" "/var/log/netwatch/export"
+    ;;
+  where)
+    echo "Service: /etc/systemd/system/netwatch.service"
+    echo "Lib:     /usr/local/lib/netwatch"
+    echo "Config:  /etc/netwatch/netwatch.conf"
+    echo "Logs:    /var/log/netwatch"
+    echo "Export:  /var/log/netwatch/export"
     ;;
   ""|-h|--help|help)
     usage
@@ -189,8 +186,7 @@ install_config() {
     info "Config existiert bereits, lasse unverändert: ${CONF_FILE}"
   fi
 
-  # Ensure log dirs exist
-  mkdir -p /var/log/netwatch /var/log/netwatch/export
+  mkdir -p /var/log/netwatch /var/log/netwatch/export /var/log/netwatch/mtr /var/log/netwatch/iperf /var/log/netwatch/speedtest
   chmod 0755 /var/log/netwatch /var/log/netwatch/export || true
 }
 
@@ -213,11 +209,9 @@ install_systemd() {
 uninstall_all() {
   local purge="${1:-false}"
 
-  if have_cmd systemctl; then
-    systemctl disable --now "${APP}.service" 2>/dev/null || true
-    rm -f "${SYSTEMD_UNIT}"
-    systemctl daemon-reload 2>/dev/null || true
-  fi
+  systemctl disable --now "${APP}.service" 2>/dev/null || true
+  rm -f "${SYSTEMD_UNIT}"
+  systemctl daemon-reload 2>/dev/null || true
 
   rm -f "${CTL}" "${RUNNER}" "${LOGROTATE_DST}"
   rm -rf "${INSTALL_DIR}"
@@ -263,10 +257,9 @@ main() {
   echo "Config: ${CONF_FILE}"
   echo "Status: netwatch status"
   echo "Logs: netwatch logs"
-  echo "Report: netwatch report"
-  echo "Export: netwatch export"
+  echo "Reports: netwatch report"
+  echo "Evidence: netwatch export"
   echo "Uninstall: sudo bash ${INSTALL_DIR}/install.sh --uninstall"
-  echo "Purge: sudo bash ${INSTALL_DIR}/install.sh --purge"
 }
 
 main "$@"

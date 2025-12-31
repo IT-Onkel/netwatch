@@ -1,4 +1,4 @@
-/var/log/netwatch/*.log /var/log/netwatch/*.jsonl /var/log/netwatch/*.csv {
+/var/log/netwatch/*.log /var/log/netwatch/*.csv /var/log/netwatch/events.jsonl {
   daily
   rotate 14
   missingok

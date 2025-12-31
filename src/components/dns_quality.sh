@@ -1,65 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Produces: dns_5min.csv
-. "$(dirname "$0")/../lib.sh"
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "$0")" && pwd)/../lib.sh"
 
-dns_query() {
-  local resolver="$1" domain="$2" rr="$3"
-  local out rc status qtime token
-  rc=0
-  out="$(dig @"$resolver" "$domain" "$rr" +tries=1 +time=2 +stats 2>&1)" || rc=$?
+usage() { die "usage: dns_quality.sh window LOG_DIR WINDOW_S RESOLVER domain1 domain2 ... [RR]"; }
 
-  if grep -qiE 'connection timed out|no servers could be reached' <<<"$out"; then
-    token="TIMEOUT"
-  elif [[ "$rc" -ne 0 ]]; then
-    token="ERROR"
-  else
-    status="$(sed -n 's/.* status: \([A-Z]*\).*/\1/p' <<<"$out" | head -n1 || true)"
-    case "${status:-}" in
-      NOERROR) token="OK" ;;
-      NXDOMAIN) token="NXDOMAIN" ;;
-      SERVFAIL) token="SERVFAIL" ;;
-      REFUSED) token="REFUSED" ;;
-      *) token="UNKNOWN" ;;
-    esac
+cmd="${1:-}"; shift || true
+[[ "$cmd" == "window" ]] || usage
+
+LOG_DIR="${1:-}"; WINDOW_S="${2:-}"; RESOLVER="${3:-}"; shift 3 || true
+[[ -n "$LOG_DIR" && -n "$WINDOW_S" && -n "$RESOLVER" ]] || usage
+[[ "$#" -ge 1 ]] || usage
+
+# optional last arg RR if looks like RR type
+RR="A"
+last="${*: -1}"
+if [[ "$last" =~ ^(A|AAAA|TXT|NS|SOA)$ ]]; then
+  RR="$last"
+  set -- "${@:1:$(($#-1))}"
+fi
+
+mkdirp "$LOG_DIR"
+
+DIG="${DIG_BIN:-}"
+if [[ -z "${DIG}" ]]; then
+  DIG="$(command -v dig || true)"
+fi
+[[ -n "$DIG" ]] || die "dig not found (install dnsutils)"
+
+ts="$(ts_iso)"
+token="$(date +%s)"
+for domain in "$@"; do
+  # dig output:
+  # - status in header, query time in stats
+  out="$("$DIG" @"$RESOLVER" "$domain" "$RR" +time=2 +tries=1 +stats 2>&1 || true)"
+  status="$(echo "$out" | awk '/status:/{gsub(/,/, "", $6); print $6; exit}' || true)"
+  qtime="$(echo "$out" | awk -F': ' '/Query time:/{print $2}' | awk '{print $1}' || true)"
+
+  if echo "$out" | grep -qiE 'connection timed out|no servers could be reached'; then
+    status="TIMEOUT"
+  elif [[ -z "$status" ]]; then
+    # could be SERVFAIL/REFUSED/etc in some variants
+    status="UNKNOWN"
   fi
 
-  qtime="$(awk '/^;; Query time:/{print $4; exit}' <<<"$out" 2>/dev/null || true)"
-  status="${status:-NA}"
-  qtime="${qtime:-NA}"
-  echo "${token}|${status}|${qtime}"
-}
-
-dns_summary_rows() {
-  local log_dir="$1" window_s="$2" resolver="$3"
-  shift 3
-  local domains=("$@")
-  local now_iso rr d r token status qtime
-
-  now_iso="$(ts_iso)"
-  for d in "${domains[@]}"; do
-    for rr in A AAAA; do
-      r="$(dns_query "$resolver" "$d" "$rr")"
-      token="${r%%|*}"
-      status="$(cut -d'|' -f2 <<<"$r")"
-      qtime="$(cut -d'|' -f3 <<<"$r")"
-      printf "%s,%s,%s,%s,%s,%s,%s,%s\n" \
-        "${now_iso}" "${window_s}" "${resolver}" "${d}" "${rr}" "${status}" "${qtime}" "${token}" \
-        >> "${log_dir}/dns_5min.csv"
-    done
-  done
-}
-
-main() {
-  local log_dir="${1:-}"
-  local window_s="${2:-300}"
-  local resolver="${3:-}"
-  shift 3 || true
-  local domains=("$@")
-
-  [[ -n "$log_dir" && -n "$resolver" && "${#domains[@]}" -gt 0 ]] || die "usage: dns_quality.sh LOG_DIR window_s RESOLVER domain1 domain2 ..."
-
-  dns_summary_rows "$log_dir" "$window_s" "$resolver" "${domains[@]}"
-}
-
-main "$@"
+  csv_append "${LOG_DIR}/dns_5min.csv" "${ts},${WINDOW_S},${RESOLVER},${domain},${RR},${status},${qtime:-},${token}"
+done
