@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export LC_ALL=C
+
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
 . "${BASE_DIR}/../lib.sh"
@@ -13,10 +15,10 @@ mkdirp "$EXPORT_DIR"
 # load thresholds if config exists
 if [[ -f "$CONF" ]]; then
   # shellcheck disable=SC1090
-  source "$CONF"
+  source "$CONF" || true
 fi
 
-# defaults if not in config
+# defaults if not in config (keep existing names for compatibility)
 : "${TH_PING_LOSS_PCT_WARN:=1}"
 : "${TH_PING_LOSS_PCT_FAIL:=3}"
 : "${TH_PING_RTT_AVG_MS_WARN:=60}"
@@ -46,9 +48,70 @@ out_h="${EXPORT_DIR}/report_human.md"
 out_t="${EXPORT_DIR}/report_tech.md"
 out_j="${EXPORT_DIR}/report_evidence.json"
 
+# ---------------------------
+# Helpers (robust numeric parsing)
+# ---------------------------
+
+# Print a normalized number or nothing.
+# - converts comma decimal to dot
+# - strips non-number chars (keeps digits, dot, minus)
+norm_num() {
+  local s="${1:-}"
+  s="${s//,/.}"
+  # keep digits, dot, minus only
+  s="$(printf "%s" "$s" | tr -cd '0-9.-')"
+  # reject empty / only "-" / "." etc.
+  if [[ -z "$s" || "$s" == "-" || "$s" == "." || "$s" == "-." ]]; then
+    printf ""
+    return 0
+  fi
+  printf "%s" "$s"
+}
+
+# Read numbers from stdin, normalize, print only valid ones (one per line)
+filter_nums() {
+  while IFS= read -r line; do
+    n="$(norm_num "$line")"
+    [[ -n "$n" ]] && printf "%s\n" "$n"
+  done
+}
+
+# Safe wrapper around percentile/median: returns empty if no valid numbers
+safe_percentile() {
+  local p="$1"
+  local tmp
+  tmp="$(mktemp)"
+  filter_nums >"$tmp" || true
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    printf ""
+    return 0
+  fi
+  # percentile function comes from lib.sh
+  percentile "$p" <"$tmp" || true
+  rm -f "$tmp"
+}
+
+safe_median() {
+  local tmp
+  tmp="$(mktemp)"
+  filter_nums >"$tmp" || true
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    printf ""
+    return 0
+  fi
+  median <"$tmp" || true
+  rm -f "$tmp"
+}
+
+# grade() compatible with existing behavior, but normalizes inputs to avoid awk issues
 grade() {
-  local value="$1" warn="$2" fail="$3" mode="${4:-highbad}"
-  # highbad: higher is worse; lowbad: lower is worse
+  local value warn fail mode="${4:-highbad}"
+  value="$(norm_num "${1:-}")"
+  warn="$(norm_num "${2:-}")"
+  fail="$(norm_num "${3:-}")"
+
   awk -v v="$value" -v w="$warn" -v f="$fail" -v m="$mode" '
     BEGIN{
       if(v=="" || w=="" || f==""){print "UNKNOWN"; exit 0}
@@ -66,6 +129,7 @@ grade() {
 
 # ---------------------------
 # PING summary from ping_5min.csv
+# Header: time_iso,window_s,target,sent,received,loss_pct,rtt_min_ms,rtt_avg_ms,rtt_max_ms,rtt_mdev_ms
 # ---------------------------
 ping_csv="${LOG_DIR}/ping_5min.csv"
 ping_targets=""
@@ -75,10 +139,9 @@ ping_jitter_p95=""
 
 if [[ -f "$ping_csv" ]]; then
   ping_targets="$(awk -F',' 'NR>1{t[$3]=1} END{for(k in t) print k}' "$ping_csv" | sort | tr '\n' ' ' | sed 's/ *$//')"
-  # Use p95 for loss and rtt_avg and mdev (as jitter-ish)
-  ping_loss_p95="$(awk -F',' 'NR>1 && $6!=""{print $6}' "$ping_csv" | percentile 95)"
-  ping_rtt_p95="$(awk -F',' 'NR>1 && $8!=""{print $8}' "$ping_csv" | percentile 95)"
-  ping_jitter_p95="$(awk -F',' 'NR>1 && $10!=""{print $10}' "$ping_csv" | percentile 95)"
+  ping_loss_p95="$(awk -F',' 'NR>1{print $6}' "$ping_csv" | safe_percentile 95)"
+  ping_rtt_p95="$(awk -F',' 'NR>1{print $8}' "$ping_csv" | safe_percentile 95)"
+  ping_jitter_p95="$(awk -F',' 'NR>1{print $10}' "$ping_csv" | safe_percentile 95)"
 fi
 
 g_ping_loss="$(grade "$ping_loss_p95" "$TH_PING_LOSS_PCT_WARN" "$TH_PING_LOSS_PCT_FAIL" highbad)"
@@ -87,17 +150,20 @@ g_ping_jit="$(grade "$ping_jitter_p95" "$TH_PING_JITTER_MS_WARN" "$TH_PING_JITTE
 
 # ---------------------------
 # DNS summary from dns_5min.csv
+# Header: time_iso,window_s,resolver,domain,rr,status,qtime_ms,token
+# status may be TIMEOUT/NOERROR/etc (case-insensitive)
 # ---------------------------
 dns_csv="${LOG_DIR}/dns_5min.csv"
 dns_timeout_pct=""
 dns_qtime_p95=""
-dns_total=""
+dns_total="0"
+dns_timeouts="0"
 
 if [[ -f "$dns_csv" ]]; then
   dns_total="$(awk -F',' 'NR>1{c++} END{print c+0}' "$dns_csv")"
-  dns_timeouts="$(awk -F',' 'NR>1 && $6=="TIMEOUT"{c++} END{print c+0}' "$dns_csv")"
+  dns_timeouts="$(awk -F',' 'NR>1{ s=toupper($6); if(s=="TIMEOUT") c++ } END{print c+0}' "$dns_csv")"
   dns_timeout_pct="$(awk -v t="$dns_total" -v to="$dns_timeouts" 'BEGIN{ if(t==0) print ""; else printf "%.2f", (to/t)*100 }')"
-  dns_qtime_p95="$(awk -F',' 'NR>1 && $7!=""{print $7}' "$dns_csv" | percentile 95)"
+  dns_qtime_p95="$(awk -F',' 'NR>1{print $7}' "$dns_csv" | safe_percentile 95)"
 fi
 
 g_dns_to="$(grade "$dns_timeout_pct" "$TH_DNS_TIMEOUT_PCT_WARN" "$TH_DNS_TIMEOUT_PCT_FAIL" highbad)"
@@ -105,21 +171,23 @@ g_dns_qt="$(grade "$dns_qtime_p95" "$TH_DNS_QTIME_MS_WARN" "$TH_DNS_QTIME_MS_FAI
 
 # ---------------------------
 # Speedtest summary from speedtest.csv
+# Header: time_iso,provider,ping_ms,down_mbps,up_mbps,packet_loss,result_url,status,error
+# status is col 8
 # ---------------------------
 st_csv="${LOG_DIR}/speedtest.csv"
-st_runs=""
-st_ok=""
+st_runs="0"
+st_ok="0"
 st_down_med=""
 st_up_med=""
 st_ping_med=""
 
 if [[ -f "$st_csv" ]]; then
   st_runs="$(awk -F',' 'NR>1{c++} END{print c+0}' "$st_csv")"
-  st_ok="$(awk -F',' 'NR>1 && $8=="ok"{c++} END{print c+0}' "$st_csv")"
+  st_ok="$(awk -F',' 'NR>1{ s=tolower($8); if(s=="ok") c++ } END{print c+0}' "$st_csv")"
 
-  st_down_med="$(awk -F',' 'NR>1 && $4!=""{print $4}' "$st_csv" | median)"
-  st_up_med="$(awk -F',' 'NR>1 && $5!=""{print $5}' "$st_csv" | median)"
-  st_ping_med="$(awk -F',' 'NR>1 && $3!=""{print $3}' "$st_csv" | median)"
+  st_down_med="$(awk -F',' 'NR>1{print $4}' "$st_csv" | safe_median)"
+  st_up_med="$(awk -F',' 'NR>1{print $5}' "$st_csv" | safe_median)"
+  st_ping_med="$(awk -F',' 'NR>1{print $3}' "$st_csv" | safe_median)"
 fi
 
 g_st_down="$(grade "$st_down_med" "$TH_SPEED_DOWN_MBPS_WARN" "$TH_SPEED_DOWN_MBPS_FAIL" lowbad)"
@@ -128,26 +196,29 @@ g_st_ping="$(grade "$st_ping_med" "$TH_SPEED_PING_MS_WARN" "$TH_SPEED_PING_MS_FA
 
 # ---------------------------
 # iperf UDP summary from iperf_udp.csv
+# Current header in your daemon:
+# time_iso,server,port,bw_mbps,jitter_ms,loss_pct,datagrams,status,raw_path
+# status col 8
 # ---------------------------
 ip_csv="${LOG_DIR}/iperf_udp.csv"
-ip_runs=""
-ip_ok=""
+ip_runs="0"
+ip_ok="0"
 ip_bw_med=""
 ip_jit_p95=""
 ip_loss_p95=""
 
 if [[ -f "$ip_csv" ]]; then
   ip_runs="$(awk -F',' 'NR>1{c++} END{print c+0}' "$ip_csv")"
-  ip_ok="$(awk -F',' 'NR>1 && $8=="ok"{c++} END{print c+0}' "$ip_csv")"
-  ip_bw_med="$(awk -F',' 'NR>1 && $4!=""{print $4}' "$ip_csv" | median)"
-  ip_jit_p95="$(awk -F',' 'NR>1 && $5!=""{print $5}' "$ip_csv" | percentile 95)"
-  ip_loss_p95="$(awk -F',' 'NR>1 && $6!=""{print $6}' "$ip_csv" | percentile 95)"
+  ip_ok="$(awk -F',' 'NR>1{ s=tolower($8); if(s=="ok") c++ } END{print c+0}' "$ip_csv")"
+  ip_bw_med="$(awk -F',' 'NR>1{print $4}' "$ip_csv" | safe_median)"
+  ip_jit_p95="$(awk -F',' 'NR>1{print $5}' "$ip_csv" | safe_percentile 95)"
+  ip_loss_p95="$(awk -F',' 'NR>1{print $6}' "$ip_csv" | safe_percentile 95)"
 fi
 
 g_ip_jit="$(grade "$ip_jit_p95" "$TH_IPERF_JITTER_MS_WARN" "$TH_IPERF_JITTER_MS_FAIL" highbad)"
 g_ip_loss="$(grade "$ip_loss_p95" "$TH_IPERF_LOSS_PCT_WARN" "$TH_IPERF_LOSS_PCT_FAIL" highbad)"
 
-# Overall headline (simple worst-of)
+# Overall headline (simple worst-of) - keep logic
 overall="OK"
 for g in "$g_ping_loss" "$g_ping_rtt" "$g_ping_jit" "$g_dns_to" "$g_dns_qt" "$g_st_down" "$g_st_up" "$g_st_ping" "$g_ip_jit" "$g_ip_loss"; do
   if [[ "$g" == "FAIL" ]]; then overall="FAIL"; break; fi
@@ -208,6 +279,7 @@ p95 mdev_ms: ${ping_jitter_p95:-n/a}
 
 ## DNS (aus dns_5min.csv)
 Tests: ${dns_total:-0}
+Timeouts: ${dns_timeouts:-0}
 Timeout %: ${dns_timeout_pct:-n/a}
 p95 Query time ms: ${dns_qtime_p95:-n/a}
 
@@ -226,6 +298,7 @@ EOF
 
 # ---------------------------
 # Evidence JSON (maschinenlesbar)
+# Keep compatible output structure (strings), but make values safe
 # ---------------------------
 cat >"$out_j" <<EOF
 {
@@ -242,6 +315,7 @@ cat >"$out_j" <<EOF
   },
   "dns": {
     "tests": "$(printf "%s" "${dns_total:-0}")",
+    "timeouts": "$(printf "%s" "${dns_timeouts:-0}")",
     "timeouts_pct": "$(printf "%s" "${dns_timeout_pct:-}")",
     "qtime_p95_ms": "$(printf "%s" "${dns_qtime_p95:-}")",
     "grade_timeouts": "$(printf "%s" "$g_dns_to")",
