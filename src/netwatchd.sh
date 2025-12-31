@@ -173,7 +173,7 @@ main() {
 
     # --- iperf UDP (optional) ---
     if [[ "${now}" -ge "${next_iperf}" ]]; then
-      run_component_optional "iperf_udp.sh" run "${LOG_DIR}" "${IPERF3_SERVER:-}" "${IPERF3_PORT:-5201}" "${IPERF3_UDP_BW:-5M}" "${IPERF3_UDP_TIME:-20}"
+      run_component_optional "iperf_udp.sh" run "${LOG_DIR}" "${IPERF3_SERVER:-ping.online.net}" "${IPERF3_PORT:-5201}" "${IPERF3_UDP_BW:-5M}" "${IPERF3_UDP_TIME:-10}" "${SPEEDTEST_TIMEOUT_SEC:-60}"
       next_iperf=$(( now + IPERF_UDP_INTERVAL_SEC ))
     fi
 
